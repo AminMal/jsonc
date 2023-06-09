@@ -1,100 +1,116 @@
-use constants::*;
-use formatting::*;
-use serde_json::Value;
-use std::fmt::Display;
-use std::fs::File;
-use std::io::{self, BufRead};
-
 pub mod constants;
-pub mod formatting;
+pub mod language;
+
+use std::fs::File;
+use std::io::{self, BufRead, Error};
+use std::rc::Rc;
+
+use serde_json::Value;
+
+use constants::*;
+use language::*;
 
 type StructValue = String;
 type ArrayType = String;
-
-fn infer_struct_name_from_array_key(arr_key: String) -> String {
-    if let Some(stripped) = arr_key.strip_suffix("ies") {
-        format!("{}y", create_go_key(stripped))
-    } else if let Some(stripped) = arr_key.strip_suffix("s") {
-        create_go_key(stripped)
-    } else {
-        create_go_key(arr_key.as_str())
-    }
-}
 
 fn infer_array(
     key: Option<String>,
     value: &Value,
     structs_into: &mut Vec<StructValue>,
+    lang: Rc<dyn LanguageFormatter>,
 ) -> ArrayType {
     if let Value::Array(arr) = value {
-        let has_null_values = arr.iter().find(|&js| js.is_null()).is_some();
-        let nullable = if has_null_values { PTR } else { NOT_NULL };
+        let optional = arr.iter().any(Value::is_null);
 
         let non_null_values: Vec<&Value> = arr.iter().filter(|js| !js.is_null()).collect();
+
         if non_null_values.is_empty() {
-            format_array_type(ANY, nullable)
+            let null = Value::Null;
+            lang.format_arr_type(lang.premitive_type_name(&null).to_owned(), optional)
         } else {
             let first_inferrable_value = non_null_values[0];
             match first_inferrable_value {
                 Value::Array(_) => {
-                    let inner_arr_type = infer_array(key, first_inferrable_value, structs_into);
-                    format_array_type(&inner_arr_type, nullable)
+                    let inner_arr_type =
+                        infer_array(key, first_inferrable_value, structs_into, Rc::clone(&lang));
+                    lang.format_arr_type(inner_arr_type, optional)
                 }
                 Value::Object(_) => {
-                    let struct_name = infer_struct_name_from_array_key(
-                        key.unwrap_or_else(|| String::from(AUTO_GENERATED)),
+                    let struct_name = lang.struct_or_class_name(
+                        key.unwrap_or_else(|| String::from(GO_AUTO_GENERATED))
+                            .as_str(),
                     );
-                    infer_struct(struct_name.clone(), first_inferrable_value)
-                        .iter()
-                        .for_each(|st| structs_into.push(st.to_owned()));
-                    format_array_type(&struct_name, nullable)
+                    infer_struct(
+                        struct_name.clone(),
+                        first_inferrable_value,
+                        Rc::clone(&lang),
+                    )
+                    .iter()
+                    .for_each(|st| structs_into.push(st.to_owned()));
+                    lang.format_arr_type(struct_name, optional)
                 }
-                other => format_array_type(get_primitive_type_name(other), nullable),
+                other => {
+                    lang.format_arr_type(lang.premitive_type_name(&other).to_owned(), optional)
+                }
             }
         }
     } else {
-        format_array_type(ANY, NOT_NULL)
+        let null: Value = Value::Null;
+        lang.format_arr_type(lang.premitive_type_name(&null).to_string(), false)
     }
 }
 
-fn infer_struct(struct_name: String, obj: &Value) -> Vec<StructValue> {
+fn infer_struct(
+    struct_name: String,
+    obj: &Value,
+    lang: Rc<dyn LanguageFormatter>,
+) -> Vec<StructValue> {
     let mut result: Vec<StructValue> = vec![];
-    let go_struct_name = create_go_key(&struct_name);
-    let mut struct_content: StructValue =
-        (format!("type {go_struct_name} struct") + " {\n").to_string();
+    let mut struct_content: String = lang.struct_or_class_header(struct_name.clone());
 
     if let Value::Object(o) = obj {
-        o.iter().for_each(|(json_key, json)| {
-            let go_key = create_go_key(json_key.as_str());
-            match json {
-                Value::Object(_) => {
-                    let inner_struct = infer_struct(json_key.to_owned(), json);
-                    inner_struct.iter().for_each(|v| result.push(v.to_owned()));
-                }
-                Value::Array(_) => {
-                    let arr_type = infer_array(Some(json_key.to_owned()), json, &mut result);
-                    struct_content
-                        .push_str(format_member_definition(go_key, &arr_type, json_key).as_str());
-                }
-                other => struct_content.push_str(
-                    format_member_definition(go_key, get_primitive_type_name(other), &json_key)
-                        .as_str(),
-                ),
+        o.iter().for_each(|(json_key, json)| match json {
+            Value::Object(_) => {
+                let inner_struct = infer_struct(json_key.to_owned(), json, Rc::clone(&lang));
+                inner_struct.iter().for_each(|v| result.push(v.to_owned()));
+                struct_content.push_str(
+                    lang.format_field_type(
+                        &lang.struct_or_class_name(json_key),
+                        &lang.field_name(json_key),
+                    )
+                    .as_str(),
+                );
             }
+            Value::Array(_) => {
+                let arr_type = infer_array(
+                    Some(json_key.to_owned()),
+                    json,
+                    &mut result,
+                    Rc::clone(&lang),
+                );
+                struct_content.push_str(lang.format_field_type(&arr_type, json_key).as_str());
+            }
+            other => struct_content.push_str(
+                lang.format_field_type(lang.premitive_type_name(other), json_key)
+                    .as_str(),
+            ),
         });
-        struct_content.push_str("}");
+        struct_content.push_str(
+            lang.struct_or_class_footer(Some(struct_name.clone()))
+                .as_str(),
+        );
     }
     result.push(struct_content.to_owned());
     result
 }
 
-fn generate_types(value: Value) -> Vec<StructValue> {
+fn generate_types(value: Value, lang: Rc<dyn LanguageFormatter>) -> Vec<StructValue> {
     let mut result: Vec<StructValue> = vec![];
     match value {
         Value::Array(_) => {
-            infer_array(None, &value, &mut result);
+            infer_array(None, &value, &mut result, lang);
         }
-        Value::Object(_) => infer_struct(AUTO_GENERATED.to_string(), &value)
+        Value::Object(_) => infer_struct(GO_AUTO_GENERATED.to_string(), &value, lang)
             .iter()
             .for_each(|s| result.push(s.to_owned())),
         _ => {}
@@ -104,6 +120,7 @@ fn generate_types(value: Value) -> Vec<StructValue> {
 
 fn usage(app: String) {
     eprintln!("usages of {app}:");
+    eprintln!("OPTIONS: \n\t[-l|--language]: Specify the output programming language");
     eprintln!("\t--help:\t\tshow current window");
     eprintln!("\t{app} [FILE]:\tread json file and convert to go structs");
     eprintln!(
@@ -111,6 +128,26 @@ fn usage(app: String) {
     );
 }
 
+fn from_filepath(
+    filepath: &str,
+    lang: Rc<dyn LanguageFormatter>,
+) -> Result<Vec<StructValue>, Error> {
+    let file = File::open(filepath)?;
+    let value: Value = serde_json::from_reader(file)?;
+    Ok(generate_types(value, lang))
+}
+
+fn acquire_pipe(lang: Rc<dyn LanguageFormatter>) -> Vec<StructValue> {
+    let stdin = io::stdin().lock();
+
+    let all_lines = stdin.lines().fold(String::new(), |mut buff, line| {
+        buff.push_str(line.unwrap().as_str());
+        buff
+    });
+
+    let value: Value = serde_json::from_str(all_lines.as_str()).unwrap();
+    generate_types(value, lang)
+}
 
 fn main() {
     // first argument is usually the application name
@@ -120,24 +157,25 @@ fn main() {
                 usage(std::env::args().nth(0).unwrap());
                 std::process::exit(0);
             }
+            "-l" | "--language" => {
+                let lang = std::env::args()
+                    .nth(2)
+                    .expect("Programming language not specified");
+                let lang_specifier = get_language_formatter(lang.as_str())
+                    .expect("Couldn't find the language specifier");
+
+                if let Some(filepath) = std::env::args().nth(3) {
+                    from_filepath(&filepath, lang_specifier).unwrap()
+                } else {
+                    acquire_pipe(lang_specifier)
+                }
+            }
             filepath => {
-                // read from file
-                let file = File::open(filepath).unwrap();
-                let value: Value = serde_json::from_reader(file).unwrap();
-                generate_types(value)
+                from_filepath(filepath, get_language_formatter(DEFAULT_LANG).unwrap()).unwrap()
             }
         }
     } else {
-        // read from pipe
-        let stdin = io::stdin().lock();
-
-        let all_lines = stdin.lines().fold(String::new(), |mut buff, line| {
-            buff.push_str(line.unwrap().as_str());
-            buff
-        });
-
-        let value: Value = serde_json::from_str(all_lines.as_str()).unwrap();
-        generate_types(value)
+        acquire_pipe(get_language_formatter(DEFAULT_LANG).unwrap())
     };
 
     result.iter().for_each(|structt| println!("{structt}\n"));
