@@ -5,6 +5,16 @@ There might be some occasions where you have a JSON document and you want to mod
 
 You don't want to do it manually, `jsonc` is a lightweight cli application that can do this for you.
 
+# Quick Install #
+At first, you need to have cargo installed. Given so, first you need to build the project for your specific platform:
+```sh 
+git clone https://github.com/AminMal/jsonc.git
+cd jsonc
+cargo build --release
+mv target/release/jsonc /SOMEWHERE/IN/PATH
+chmod +x /SOMEWHERE/IN/PATH/jsonc
+```
+
 -----
 ## Files ##
 There are two ways you can use `jsonc` with files:
