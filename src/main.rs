@@ -178,5 +178,6 @@ fn main() {
         acquire_pipe(get_language_formatter(DEFAULT_LANG).unwrap())
     };
 
-    result.iter().for_each(|structt| println!("{structt}\n"));
+    println!("{}", &result[0]);
+    result[1..].iter().for_each(|s| {println!("\n{s}");})
 }
